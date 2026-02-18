@@ -121,6 +121,10 @@ def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap=8, upscale_amou
 
 
 class VAE:
+    # Conservative defaults for 12GB VRAM - 512px tiles
+    DEFAULT_TILE_SIZE_LATENT = 64   # 64 latent = 512px for 8x compression
+    DEFAULT_OVERLAP_LATENT = 8      # 8 latent = 64px overlap
+
     def __init__(self, model=None, device=None, dtype=None, no_init=False, *, is_wan=False, is_flux2=False):
         if no_init:
             return
@@ -170,7 +174,12 @@ class VAE:
         n.memory_used_encode = self.memory_used_encode
         n.memory_used_decode = self.memory_used_decode
         n.downscale_ratio = self.downscale_ratio
+        n.upscale_ratio = self.upscale_ratio
+        n.downscale_index_formula = self.downscale_index_formula
+        n.upscale_index_formula = self.upscale_index_formula
         n.latent_channels = self.latent_channels
+        n.latent_dim = self.latent_dim
+        n.output_channels = self.output_channels
         n.first_stage_model = self.first_stage_model
         n.device = self.device
         n.vae_dtype = self.vae_dtype
@@ -178,130 +187,286 @@ class VAE:
         n.is_wan = self.is_wan
         return n
 
-    def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
-        output = self.process_output((tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device) + tiled_scale(samples, decode_fn, tile_x, tile_y, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device)) / 3.0)
-        return output
+    # ==================== TILING HELPER METHODS ====================
+
+    def _get_spatial_ratio(self):
+        """Get the spatial compression ratio for 2D operations."""
+        if isinstance(self.upscale_ratio, tuple):
+            return self.upscale_ratio[-1]
+        return self.upscale_ratio
+
+    @staticmethod
+    def _make_linear_ramp(size, direction='up'):
+        """Create a 1D linear ramp on CPU for blending."""
+        if direction == 'up':
+            return torch.linspace(0.0, 1.0, size, dtype=torch.float32)
+        else:
+            return torch.linspace(1.0, 0.0, size, dtype=torch.float32)
+
+    def _decode_tile_to_cpu(self, samples):
+        """Decode a single tile on GPU, return result on CPU immediately."""
+        samples_gpu = samples.to(self.vae_dtype).to(self.device)
+        decoded = self.first_stage_model.decode(samples_gpu)
+        return self.process_output(decoded.float()).cpu()
+
+    def _encode_tile_to_cpu(self, pixels):
+        """Encode a single tile on GPU, return result on CPU immediately."""
+        pixels_gpu = self.process_input(pixels).to(self.vae_dtype).to(self.device)
+        encoded = self.first_stage_model.encode(pixels_gpu)
+        return encoded.float().cpu()
+
+    def _decode_tiled_cpu_accumulate(self, samples, tile_x, tile_y, overlap):
+        """
+        Tiled decode with CPU accumulation and linear blend ramps.
+        GPU only processes one tile at a time, all blending on CPU.
+        Handles non-square images correctly via independent x/y tile loops.
+        """
+        b, c, h, w = samples.shape
+        ratio = self._get_spatial_ratio()
+        out_h = h * ratio
+        out_w = w * ratio
+        overlap_px = overlap * ratio
+
+        # All accumulation on CPU (uses system RAM)
+        output = torch.zeros((b, self.output_channels, out_h, out_w), dtype=torch.float32)
+        weights = torch.zeros((1, 1, out_h, out_w), dtype=torch.float32)
+
+        step_x = max(1, tile_x - overlap)
+        step_y = max(1, tile_y - overlap)
+
+        # Build tile list - handles non-square images with independent x/y loops
+        tiles = []
+        y = 0
+        while y < h:
+            x = 0
+            while x < w:
+                x_end = min(x + tile_x, w)
+                y_end = min(y + tile_y, h)
+                tiles.append((x, y, x_end, y_end))
+                x += step_x
+            y += step_y
+
+        for (x, y, x_end, y_end) in tiles:
+            tile = samples[:, :, y:y_end, x:x_end]
+            decoded = self._decode_tile_to_cpu(tile)
+
+            ox = x * ratio
+            oy = y * ratio
+            ox_end = x_end * ratio
+            oy_end = y_end * ratio
+            th = oy_end - oy
+            tw = ox_end - ox
+
+            # Build blend mask on CPU
+            blend = torch.ones((1, 1, th, tw), dtype=torch.float32)
+
+            # Left edge blend
+            if x > 0 and overlap_px > 0:
+                ramp_len = min(overlap_px, tw)
+                blend[:, :, :, :ramp_len] *= self._make_linear_ramp(ramp_len, 'up').view(1, 1, 1, -1)
+
+            # Right edge blend
+            if x_end < w and overlap_px > 0:
+                ramp_len = min(overlap_px, tw)
+                blend[:, :, :, -ramp_len:] *= self._make_linear_ramp(ramp_len, 'down').view(1, 1, 1, -1)
+
+            # Top edge blend
+            if y > 0 and overlap_px > 0:
+                ramp_len = min(overlap_px, th)
+                blend[:, :, :ramp_len, :] *= self._make_linear_ramp(ramp_len, 'up').view(1, 1, -1, 1)
+
+            # Bottom edge blend
+            if y_end < h and overlap_px > 0:
+                ramp_len = min(overlap_px, th)
+                blend[:, :, -ramp_len:, :] *= self._make_linear_ramp(ramp_len, 'down').view(1, 1, -1, 1)
+
+            # Accumulate on CPU
+            output[:, :, oy:oy_end, ox:ox_end] += decoded * blend
+            weights[:, :, oy:oy_end, ox:ox_end] += blend
+
+        return output / weights.clamp(min=1e-8)
+
+    def _encode_tiled_cpu_accumulate(self, pixel_samples, tile_x, tile_y, overlap):
+        """
+        Tiled encode with CPU accumulation and linear blend ramps.
+        GPU only processes one tile at a time, all blending on CPU.
+        Handles non-square images correctly via independent x/y tile loops.
+        """
+        b, c, h, w = pixel_samples.shape
+        ratio = self._get_spatial_ratio()
+        out_h = h // ratio
+        out_w = w // ratio
+        overlap_latent = overlap // ratio
+
+        output = torch.zeros((b, self.latent_channels, out_h, out_w), dtype=torch.float32)
+        weights = torch.zeros((1, 1, out_h, out_w), dtype=torch.float32)
+
+        step_x = max(ratio, tile_x - overlap)
+        step_y = max(ratio, tile_y - overlap)
+
+        tiles = []
+        y = 0
+        while y < h:
+            x = 0
+            while x < w:
+                x_end = min(x + tile_x, w)
+                y_end = min(y + tile_y, h)
+                tiles.append((x, y, x_end, y_end))
+                x += step_x
+            y += step_y
+
+        for (x, y, x_end, y_end) in tiles:
+            tile = pixel_samples[:, :, y:y_end, x:x_end]
+            encoded = self._encode_tile_to_cpu(tile)
+
+            ox = x // ratio
+            oy = y // ratio
+            ox_end = x_end // ratio
+            oy_end = y_end // ratio
+            th = oy_end - oy
+            tw = ox_end - ox
+
+            blend = torch.ones((1, 1, th, tw), dtype=torch.float32)
+
+            if x > 0 and overlap_latent > 0:
+                ramp_len = min(overlap_latent, tw)
+                blend[:, :, :, :ramp_len] *= self._make_linear_ramp(ramp_len, 'up').view(1, 1, 1, -1)
+
+            if x_end < w and overlap_latent > 0:
+                ramp_len = min(overlap_latent, tw)
+                blend[:, :, :, -ramp_len:] *= self._make_linear_ramp(ramp_len, 'down').view(1, 1, 1, -1)
+
+            if y > 0 and overlap_latent > 0:
+                ramp_len = min(overlap_latent, th)
+                blend[:, :, :ramp_len, :] *= self._make_linear_ramp(ramp_len, 'up').view(1, 1, -1, 1)
+
+            if y_end < h and overlap_latent > 0:
+                ramp_len = min(overlap_latent, th)
+                blend[:, :, -ramp_len:, :] *= self._make_linear_ramp(ramp_len, 'down').view(1, 1, -1, 1)
+
+            output[:, :, oy:oy_end, ox:ox_end] += encoded * blend
+            weights[:, :, oy:oy_end, ox:ox_end] += blend
+
+        return output / weights.clamp(min=1e-8)
+
+    # ==================== TILED DECODE/ENCODE ====================
+
+    @torch.inference_mode()
+    def decode_tiled_(self, samples, tile_x=None, tile_y=None, overlap=None):
+        """
+        Tiled VAE decode with CPU accumulation.
+        One tile at a time on GPU, all blending on CPU.
+        """
+        b, c, h, w = samples.shape
+
+        if tile_x is None:
+            tile_x = self.DEFAULT_TILE_SIZE_LATENT
+        if tile_y is None:
+            tile_y = self.DEFAULT_TILE_SIZE_LATENT
+        if overlap is None:
+            overlap = self.DEFAULT_OVERLAP_LATENT
+
+        # Clamp to image size
+        tile_x = min(tile_x, w)
+        tile_y = min(tile_y, h)
+
+        # Single tile case - no tiling needed
+        if w <= tile_x and h <= tile_y:
+            return self._decode_tile_to_cpu(samples).to(self.output_device)
+
+        # Clear GPU memory once before starting
+        if self.device.type != 'cpu':
+            torch.cuda.empty_cache()
+
+        return self._decode_tiled_cpu_accumulate(samples, tile_x, tile_y, overlap).to(self.output_device)
 
     def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
         decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
         return self.process_output(tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))
 
-    def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap=64):
-        encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
-        samples = tiled_scale(pixel_samples, encode_fn, tile_x, tile_y, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x * 2, tile_y // 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples += tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=(1 / self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
-        samples /= 3.0
-        return samples
+    @torch.inference_mode()
+    def encode_tiled_(self, pixel_samples, tile_x=None, tile_y=None, overlap=None):
+        """
+        Tiled VAE encode with CPU accumulation.
+        One tile at a time on GPU, all blending on CPU.
+        """
+        b, c, h, w = pixel_samples.shape
+        ratio = self._get_spatial_ratio()
+
+        # Defaults in pixel space
+        if tile_x is None:
+            tile_x = self.DEFAULT_TILE_SIZE_LATENT * ratio
+        if tile_y is None:
+            tile_y = self.DEFAULT_TILE_SIZE_LATENT * ratio
+        if overlap is None:
+            overlap = self.DEFAULT_OVERLAP_LATENT * ratio
+
+        tile_x = min(tile_x, w)
+        tile_y = min(tile_y, h)
+
+        if w <= tile_x and h <= tile_y:
+            return self._encode_tile_to_cpu(pixel_samples).to(self.output_device)
+
+        if self.device.type != 'cpu':
+            torch.cuda.empty_cache()
+
+        return self._encode_tiled_cpu_accumulate(pixel_samples, tile_x, tile_y, overlap).to(self.output_device)
 
     def encode_tiled_3d(self, samples, tile_t=9999, tile_x=512, tile_y=512, overlap=(1, 64, 64)):
         encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
         return tiled_scale_multidim(samples, encode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.downscale_ratio, out_channels=self.latent_channels, downscale=True, index_formulas=self.downscale_index_formula, output_device=self.output_device)
 
+    # ==================== PUBLIC API ====================
+
     def decode(self, samples_in: torch.Tensor):
-        if memory_management.VAE_ALWAYS_TILED:
-            return self.decode_tiled(samples_in).to(self.output_device)
+        """Always uses tiled decode for memory safety."""
+        return self.decode_tiled(samples_in)
 
-        pixel_samples = None
-        _tile = False
-
-        try:
-            memory_used = self.memory_used_decode(samples_in.shape, self.vae_dtype)
-            memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
-            free_memory = memory_management.get_free_memory(self.device)
-            batch_number = int(free_memory / memory_used)
-            batch_number = max(1, batch_number)
-
-            for x in range(0, samples_in.shape[0], batch_number):
-                samples = samples_in[x : x + batch_number].to(self.vae_dtype).to(self.device)
-                out = self.process_output(self.first_stage_model.decode(samples).to(self.output_device).float())
-                if pixel_samples is None:
-                    pixel_samples = torch.empty((samples_in.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
-                pixel_samples[x : x + batch_number] = out
-        except memory_management.OOM_EXCEPTION:
-            print("Warning: Encountered Out of Memory during VAE decoding; Retrying with Tiled VAE Decoding...")
-            _tile = True
-
-        if _tile:
-            memory_management.soft_empty_cache()
-            return self.decode_tiled(samples_in).to(self.output_device)
-
-        pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
-        return pixel_samples
-
-    def decode_tiled(self, samples: torch.Tensor, tile_x: int = 64, tile_y: int = 64, overlap: int = 16):
+    def decode_tiled(self, samples: torch.Tensor, tile_x: int = None, tile_y: int = None, overlap: int = None):
         memory_used = self.memory_used_decode(samples.shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
 
-        args = {
-            "tile_x": tile_x,
-            "tile_y": tile_y,
-            "overlap": overlap,
-        }
+        if tile_x is None:
+            tile_x = self.DEFAULT_TILE_SIZE_LATENT
+        if tile_y is None:
+            tile_y = self.DEFAULT_TILE_SIZE_LATENT
+        if overlap is None:
+            overlap = self.DEFAULT_OVERLAP_LATENT
 
         if not self.is_wan:
-            output = self.decode_tiled_(samples, **args)
+            output = self.decode_tiled_(samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap)
         else:
-            args["overlap"] = (1, overlap, overlap)
-            output = self.decode_tiled_3d(samples, **args)
+            output = self.decode_tiled_3d(samples, tile_x=tile_x, tile_y=tile_y, overlap=(1, overlap, overlap))
 
         return output.movedim(1, -1)
 
     def encode(self, pixel_samples: torch.Tensor):
-        if memory_management.VAE_ALWAYS_TILED:
-            return self.encode_tiled(pixel_samples)
+        """Always uses tiled encode for memory safety."""
+        return self.encode_tiled(pixel_samples)
 
-        _samples = pixel_samples.movedim(-1, 1)
-        if self.is_wan and _samples.ndim < 5:
-            _samples = _samples.movedim(1, 0).unsqueeze(0)
-
-        try:
-            memory_used = self.memory_used_encode(_samples.shape, self.vae_dtype)
-            memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
-            free_memory = memory_management.get_free_memory(self.device)
-            batch_number = int(free_memory / max(1, memory_used))
-            batch_number = max(1, batch_number)
-            samples = None
-            for x in range(0, _samples.shape[0], batch_number):
-                pixels_in = self.process_input(_samples[x : x + batch_number]).to(self.vae_dtype).to(self.device)
-                out = self.first_stage_model.encode(pixels_in).to(self.output_device).float()
-                if samples is None:
-                    samples = torch.empty((_samples.shape[0],) + tuple(out.shape[1:]), device=self.output_device)
-                samples[x : x + batch_number] = out
-            _tile = False
-        except memory_management.OOM_EXCEPTION:
-            print("Warning: Encountered Out of Memory during VAE Encoding; Retrying with Tiled VAE Encoding...")
-            _tile = True
-
-        if _tile:
-            memory_management.soft_empty_cache()
-            return self.encode_tiled(pixel_samples)
-
-        return samples
-
-    def encode_tiled(self, pixel_samples: torch.Tensor, tile_x: int = 512, tile_y: int = 512, overlap: int = 64):
+    def encode_tiled(self, pixel_samples: torch.Tensor, tile_x: int = None, tile_y: int = None, overlap: int = None):
         pixel_samples = pixel_samples.movedim(-1, 1)
-        if self.is_wan:
+        if self.is_wan and pixel_samples.ndim < 5:
             pixel_samples = pixel_samples.movedim(1, 0).unsqueeze(0)
 
         memory_used = self.memory_used_encode(pixel_samples.shape, self.vae_dtype)
         memory_management.load_models_gpu([self.patcher], memory_required=memory_used)
 
-        args = {
-            "tile_x": tile_x,
-            "tile_y": tile_y,
-            "overlap": overlap,
-        }
+        ratio = self._get_spatial_ratio()
+        if tile_x is None:
+            tile_x = self.DEFAULT_TILE_SIZE_LATENT * ratio
+        if tile_y is None:
+            tile_y = self.DEFAULT_TILE_SIZE_LATENT * ratio
+        if overlap is None:
+            overlap = self.DEFAULT_OVERLAP_LATENT * ratio
 
         if not self.is_wan:
-            return self.encode_tiled_(pixel_samples, **args)
+            return self.encode_tiled_(pixel_samples, tile_x=tile_x, tile_y=tile_y, overlap=overlap)
 
-        args["tile_t"] = self.upscale_ratio[0](9999)
-        args["overlap"] = (1, overlap, overlap)
-
+        # WAN 3D encoding
+        tile_t = self.upscale_ratio[0](9999)
         maximum = self.upscale_ratio[0](self.downscale_ratio[0](pixel_samples.shape[2]))
-        return self.encode_tiled_3d(pixel_samples[:, :, :maximum], **args)
+        return self.encode_tiled_3d(pixel_samples[:, :, :maximum], tile_t=tile_t, tile_x=tile_x, tile_y=tile_y, overlap=(1, overlap, overlap))
 
     def process_input(self, image):
         return image * 2.0 - 1.0
