@@ -59,7 +59,19 @@ class TorchCompileForForge(scripts.Script):
         model = get_attr(kmodel, "_model_backup")
         set_attr_raw(kmodel, "diffusion_model", model)
         del kmodel._compile_config
+        del kmodel._compiled_backup
         del kmodel._model_backup
+
+    def before_process_batch(self, p, *args, **kwargs):
+        kmodel: "KModel" = p.sd_model.forge_objects.unet.model
+        if not hasattr(kmodel, "_compile_config"):
+            return
+
+        c_model = get_attr(kmodel, "diffusion_model")
+        set_attr_raw(kmodel, "_compiled_backup", c_model)
+        # temporarily restores the original model so LoRA can apply
+        model = get_attr(kmodel, "_model_backup")
+        set_attr_raw(kmodel, "diffusion_model", model)
 
     def process_batch(self, p, behavior: str, backend: str, mode: str, **kwargs):
         kmodel: "KModel" = p.sd_model.forge_objects.unet.model
@@ -75,10 +87,15 @@ class TorchCompileForForge(scripts.Script):
         else:
             config = dict(backend=backend, dynamic=True, fullgraph=True)
 
+        _cache: str = str(config) + p.sd_model.current_lora_hash
+
         if (_config := getattr(kmodel, "_compile_config", None)) is not None:
-            if _config != config:
+            if _config != _cache:
                 self.restore(kmodel)
             else:
+                c_model = get_attr(kmodel, "_compiled_backup")
+                set_attr_raw(kmodel, "diffusion_model", c_model)
+                del kmodel._compiled_backup
                 return
 
         model = get_attr(kmodel, "diffusion_model")
@@ -90,4 +107,4 @@ class TorchCompileForForge(scripts.Script):
             torch.compile(model, **config),
         )
 
-        kmodel._compile_config = config
+        kmodel._compile_config = _cache
