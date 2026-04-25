@@ -128,7 +128,7 @@ def run_pip(command, desc=None, live=default_command_live):
         return
 
     index_url_line = f" --index-url {index_url}" if index_url != "" else ""
-    return run(f'"{python}" -m pip {command} --prefer-binary{index_url_line}', desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
+    return run(f"uv pip {command}", desc=f"Installing {desc}", errdesc=f"Couldn't install {desc}", live=live)
 
 
 def check_run_python(code: str, *, return_error: bool = False) -> bool | tuple[bool, str]:
@@ -315,7 +315,7 @@ def prepare_environment():
     print(f"Version: {tag}")
 
     if args.reinstall_torch or not is_installed("torch") or not is_installed("torchvision"):
-        run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
+        run(torch_command, "Installing torch and torchvision", "Couldn't install torch", live=True)
         startup_timer.record("install torch")
 
     if not args.skip_torch_cuda_test:
